@@ -1,0 +1,17 @@
+diff --git a/src/mame/mame.lst b/src/mame/mame.lst
+index 3d207bfa..21a58217 100644
+--- a/src/mame/mame.lst
++++ b/src/mame/mame.lst
+@@ -20937,6 +20937,12 @@ wildfire
+ @source:hds/hds200.cpp
+ hds200
+ 
++@source:hds/viewstation.cpp
++hdsfx
++hdsfxv14
++hdsfxv16
++hdsfxvesa
++
+ @source:heathzenith/et3400.cpp
+ et3400
+ 

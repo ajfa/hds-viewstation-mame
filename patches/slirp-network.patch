@@ -1,0 +1,454 @@
+diff --git a/makefile b/makefile
+index 640bd101..d8db8863 100644
+--- a/makefile
++++ b/makefile
+@@ -719,6 +719,10 @@ ifdef USE_PCAP
+ PARAMS += --USE_PCAP='$(USE_PCAP)'
+ endif
+ 
++ifdef USE_SLIRP
++PARAMS += --USE_SLIRP='$(USE_SLIRP)'
++endif
++
+ ifdef NO_OPENGL
+ PARAMS += --NO_OPENGL='$(NO_OPENGL)'
+ endif
+diff --git a/scripts/src/osd/modules.lua b/scripts/src/osd/modules.lua
+index 3b6cede8..24d89caa 100644
+--- a/scripts/src/osd/modules.lua
++++ b/scripts/src/osd/modules.lua
+@@ -133,6 +133,7 @@ function osdmodulesbuild()
+ 		MAME_DIR .. "src/osd/modules/netdev/netdev_module.h",
+ 		MAME_DIR .. "src/osd/modules/netdev/none.cpp",
+ 		MAME_DIR .. "src/osd/modules/netdev/pcap.cpp",
++		MAME_DIR .. "src/osd/modules/netdev/slirp.cpp",
+ 		MAME_DIR .. "src/osd/modules/netdev/taptun.cpp",
+ 		MAME_DIR .. "src/osd/modules/output/console.cpp",
+ 		MAME_DIR .. "src/osd/modules/output/network.cpp",
+@@ -579,6 +580,31 @@ function osdmodulestargetconf()
+ 		end
+ 	end
+ 
++	if _OPTIONS["USE_SLIRP"]=="1" then
++		if _OPTIONS["targetos"]=="windows" then
++			-- static libslirp and glib from MSYS2, and what they need from Windows
++			links {
++				"slirp",
++				"glib-2.0",
++				"pcre2-8",
++				"intl",
++				"iconv",
++				"ws2_32",
++				"iphlpapi",
++				"dnsapi",
++				"ole32",
++				"shlwapi",
++				"uuid",
++				"winmm",
++			}
++		else
++			links {
++				"slirp",
++				"glib-2.0",
++			}
++		end
++	end
++
+ 	if _OPTIONS["targetos"]=="windows" then
+ 		links {
+ 			"gdi32",
+@@ -619,6 +645,15 @@ newoption {
+ 	},
+ }
+ 
++newoption {
++	trigger = "USE_SLIRP",
++	description = "Include libslirp user mode network module",
++	allowed = {
++		{ "0",  "Don't include libslirp network module" },
++		{ "1",  "Include libslirp network module" },
++	},
++}
++
+ newoption {
+ 	trigger = "USE_PCAP",
+ 	description = "Include pcap network module",
+diff --git a/scripts/src/osd/sdl_cfg.lua b/scripts/src/osd/sdl_cfg.lua
+index 4a2fe820..8a3d47a2 100644
+--- a/scripts/src/osd/sdl_cfg.lua
++++ b/scripts/src/osd/sdl_cfg.lua
+@@ -163,3 +163,9 @@ configuration { "netbsd" }
+ 	}
+ 
+ configuration { }
++
++if _OPTIONS["USE_SLIRP"]=="1" then
++	defines {
++		"OSD_NET_USE_SLIRP",
++	}
++end
+diff --git a/scripts/src/osd/windows_cfg.lua b/scripts/src/osd/windows_cfg.lua
+index d94c1cac..0edf1e4a 100644
+--- a/scripts/src/osd/windows_cfg.lua
++++ b/scripts/src/osd/windows_cfg.lua
+@@ -58,3 +58,9 @@ else
+ 		"USE_SDL=0",
+ 	}
+ end
++
++if _OPTIONS["USE_SLIRP"]=="1" then
++	defines {
++		"OSD_NET_USE_SLIRP",
++	}
++end
+diff --git a/src/osd/modules/lib/osdobj_common.cpp b/src/osd/modules/lib/osdobj_common.cpp
+index 9625bae6..4495c62a 100644
+--- a/src/osd/modules/lib/osdobj_common.cpp
++++ b/src/osd/modules/lib/osdobj_common.cpp
+@@ -290,6 +290,7 @@ void osd_common_t::register_options()
+ 	REGISTER_MODULE(m_mod_man, DEBUG_NONE);
+ #endif
+ 
++	REGISTER_MODULE(m_mod_man, NETDEV_SLIRP);
+ 	REGISTER_MODULE(m_mod_man, NETDEV_TAPTUN);
+ 	REGISTER_MODULE(m_mod_man, NETDEV_PCAP);
+ 	REGISTER_MODULE(m_mod_man, NETDEV_NONE);
+diff --git a/src/osd/modules/netdev/slirp.cpp b/src/osd/modules/netdev/slirp.cpp
+new file mode 100644
+index 00000000..561d391c
+--- /dev/null
++++ b/src/osd/modules/netdev/slirp.cpp
+@@ -0,0 +1,333 @@
++// license:BSD-3-Clause
++// copyright-holders:
++/*
++ * slirp.cpp
++ *
++ * User mode networking through libslirp: the guest sees a 10.0.2.0/24 network with a
++ * DHCP server, a gateway at 10.0.2.2 and a DNS forwarder at 10.0.2.3, and its TCP and
++ * UDP traffic leaves through ordinary host sockets. No privileges or host network
++ * configuration are needed.
++ */
++#include "netdev_module.h"
++
++#include "modules/osdmodule.h"
++
++#if defined(OSD_NET_USE_SLIRP)
++
++#include "netdev_common.h"
++
++#include "osdcore.h" // osd_printf_verbose
++
++#include "util/hashing.h" // crc32_creator
++
++#include <chrono>
++#include <deque>
++#include <list>
++#include <memory>
++#include <vector>
++
++#if defined(_WIN32)
++#include <winsock2.h>
++#include <ws2tcpip.h>
++#else
++#include <arpa/inet.h>
++#include <poll.h>
++#endif
++
++#include <slirp/libslirp.h>
++
++// libslirp 4.8 passes sockets as slirp_os_socket (SOCKET on Windows) through the *_socket
++// calls, and 4.7 added slirp_ssize_t
++#if SLIRP_MAJOR_VERSION > 4 || (SLIRP_MAJOR_VERSION == 4 && SLIRP_MINOR_VERSION >= 8)
++#define SLIRP_SOCKET_API 1
++typedef slirp_os_socket slirp_fd;
++#else
++#define SLIRP_SOCKET_API 0
++typedef int slirp_fd;
++#endif
++#if SLIRP_MAJOR_VERSION > 4 || (SLIRP_MAJOR_VERSION == 4 && SLIRP_MINOR_VERSION >= 7)
++typedef slirp_ssize_t slirp_len;
++#else
++typedef ssize_t slirp_len;
++#endif
++
++namespace osd {
++
++namespace {
++
++static constexpr int ETHERNET_MIN_FRAME = 64;
++
++class slirp_module : public osd_module, public netdev_module
++{
++public:
++	slirp_module() : osd_module(OSD_NETDEV_PROVIDER, "slirp"), netdev_module() { }
++	virtual ~slirp_module() { }
++
++	virtual int init(osd_interface &osd, const osd_options &options) override
++	{
++#if defined(_WIN32)
++		WSADATA data;
++		WSAStartup(MAKEWORD(2, 2), &data);
++#endif
++		return 0;
++	}
++	virtual void exit() override
++	{
++#if defined(_WIN32)
++		WSACleanup();
++#endif
++	}
++	virtual bool probe() override { return true; }
++
++	virtual std::unique_ptr<network_device> open_device(int id, network_handler &handler) override;
++	virtual std::vector<network_device_info> list_devices() override
++	{
++		return std::vector<network_device_info>{ network_device_info{ 0, "User mode network (slirp)" } };
++	}
++};
++
++class netdev_slirp : public network_device_base
++{
++public:
++	netdev_slirp(network_handler &handler);
++	~netdev_slirp();
++
++	int send(void const *buf, int len) override;
++
++protected:
++	int recv_dev(uint8_t **buf) override;
++
++private:
++	struct timer
++	{
++		SlirpTimerCb cb;
++		void *cb_opaque;
++		int64_t expire_ms;
++	};
++
++	void run_slirp();
++	int64_t now_ms() const;
++
++	// libslirp callbacks
++	static slirp_len cb_send_packet(const void *buf, size_t len, void *opaque);
++	static void cb_guest_error(const char *msg, void *opaque);
++	static int64_t cb_clock_get_ns(void *opaque);
++	static void *cb_timer_new(SlirpTimerCb cb, void *cb_opaque, void *opaque);
++	static void cb_timer_free(void *t, void *opaque);
++	static void cb_timer_mod(void *t, int64_t expire_time, void *opaque);
++	static void cb_register_poll_fd(int fd, void *opaque) { }
++	static void cb_unregister_poll_fd(int fd, void *opaque) { }
++	static void cb_notify(void *opaque) { }
++	static int cb_add_poll(slirp_fd fd, int events, void *opaque);
++	static int cb_get_revents(int idx, void *opaque);
++
++	Slirp *m_slirp = nullptr;
++	SlirpCb m_cb;
++	std::chrono::steady_clock::time_point m_epoch;
++	std::list<timer> m_timers;
++	std::deque<std::vector<uint8_t>> m_rx;
++#if defined(_WIN32)
++	std::vector<WSAPOLLFD> m_pollfds;
++#else
++	std::vector<pollfd> m_pollfds;
++#endif
++	uint8_t m_buf[2048];
++};
++
++netdev_slirp::netdev_slirp(network_handler &handler)
++	: network_device_base(handler)
++	, m_epoch(std::chrono::steady_clock::now())
++{
++	SlirpConfig cfg = {};
++	cfg.version = 1;
++	cfg.in_enabled = true;
++	inet_pton(AF_INET, "10.0.2.0", &cfg.vnetwork);
++	inet_pton(AF_INET, "255.255.255.0", &cfg.vnetmask);
++	inet_pton(AF_INET, "10.0.2.2", &cfg.vhost);
++	inet_pton(AF_INET, "10.0.2.15", &cfg.vdhcp_start);
++	inet_pton(AF_INET, "10.0.2.3", &cfg.vnameserver);
++	cfg.if_mtu = 1500;
++	cfg.if_mru = 1500;
++
++	m_cb = {};
++	m_cb.send_packet = cb_send_packet;
++	m_cb.guest_error = cb_guest_error;
++	m_cb.clock_get_ns = cb_clock_get_ns;
++	m_cb.timer_new = cb_timer_new;
++	m_cb.timer_free = cb_timer_free;
++	m_cb.timer_mod = cb_timer_mod;
++	m_cb.register_poll_fd = cb_register_poll_fd;
++	m_cb.unregister_poll_fd = cb_unregister_poll_fd;
++	m_cb.notify = cb_notify;
++
++	m_slirp = slirp_new(&cfg, &m_cb, this);
++	osd_printf_verbose("slirp: %s\n", m_slirp ? "network up" : "slirp_new failed");
++}
++
++netdev_slirp::~netdev_slirp()
++{
++	if (m_slirp)
++		slirp_cleanup(m_slirp);
++}
++
++int64_t netdev_slirp::now_ms() const
++{
++	return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - m_epoch).count();
++}
++
++int netdev_slirp::send(void const *buf, int len)
++{
++	if (!m_slirp)
++		return 0;
++	slirp_input(m_slirp, reinterpret_cast<const uint8_t *>(buf), len);
++	run_slirp();
++	return len;
++}
++
++int netdev_slirp::recv_dev(uint8_t **buf)
++{
++	if (!m_slirp)
++		return 0;
++	if (m_rx.empty())
++		run_slirp();
++	if (m_rx.empty())
++		return 0;
++
++	std::vector<uint8_t> frame = std::move(m_rx.front());
++	m_rx.pop_front();
++	u32 length = std::min<size_t>(frame.size(), sizeof(m_buf) - 4);
++	std::copy_n(frame.begin(), length, m_buf);
++
++	// pad to the Ethernet minimum and append the frame check sequence, as the taptun module does
++	if (length < ETHERNET_MIN_FRAME - 4)
++	{
++		std::fill_n(&m_buf[length], ETHERNET_MIN_FRAME - length - 4, 0);
++		length = ETHERNET_MIN_FRAME - 4;
++	}
++	const u32 fcs = util::crc32_creator::simple(m_buf, length);
++	m_buf[length++] = (fcs >> 0) & 0xff;
++	m_buf[length++] = (fcs >> 8) & 0xff;
++	m_buf[length++] = (fcs >> 16) & 0xff;
++	m_buf[length++] = (fcs >> 24) & 0xff;
++
++	*buf = m_buf;
++	return length;
++}
++
++// one non-blocking pass over the host sockets and the slirp timers
++void netdev_slirp::run_slirp()
++{
++	uint32_t timeout = 0;
++	m_pollfds.clear();
++#if SLIRP_SOCKET_API
++	slirp_pollfds_fill_socket(m_slirp, &timeout, cb_add_poll, this);
++#else
++	slirp_pollfds_fill(m_slirp, &timeout, cb_add_poll, this);
++#endif
++	int err = 0;
++	if (!m_pollfds.empty())
++	{
++#if defined(_WIN32)
++		err = WSAPoll(m_pollfds.data(), ULONG(m_pollfds.size()), 0);
++#else
++		err = ::poll(m_pollfds.data(), m_pollfds.size(), 0);
++#endif
++	}
++	slirp_pollfds_poll(m_slirp, err < 0, cb_get_revents, this);
++
++	const int64_t now = now_ms();
++	for (auto it = m_timers.begin(); it != m_timers.end(); ++it)
++	{
++		if (it->expire_ms >= 0 && it->expire_ms <= now)
++		{
++			it->expire_ms = -1;
++			it->cb(it->cb_opaque);
++		}
++	}
++}
++
++slirp_len netdev_slirp::cb_send_packet(const void *buf, size_t len, void *opaque)
++{
++	auto *self = static_cast<netdev_slirp *>(opaque);
++	auto *p = static_cast<const uint8_t *>(buf);
++	self->m_rx.emplace_back(p, p + len);
++	return len;
++}
++
++void netdev_slirp::cb_guest_error(const char *msg, void *opaque)
++{
++	osd_printf_verbose("slirp: guest error: %s\n", msg);
++}
++
++int64_t netdev_slirp::cb_clock_get_ns(void *opaque)
++{
++	auto *self = static_cast<netdev_slirp *>(opaque);
++	return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - self->m_epoch).count();
++}
++
++void *netdev_slirp::cb_timer_new(SlirpTimerCb cb, void *cb_opaque, void *opaque)
++{
++	auto *self = static_cast<netdev_slirp *>(opaque);
++	self->m_timers.push_back(timer{ cb, cb_opaque, -1 });
++	return &self->m_timers.back();
++}
++
++void netdev_slirp::cb_timer_free(void *t, void *opaque)
++{
++	auto *self = static_cast<netdev_slirp *>(opaque);
++	self->m_timers.remove_if([t] (const timer &x) { return &x == t; });
++}
++
++void netdev_slirp::cb_timer_mod(void *t, int64_t expire_time, void *opaque)
++{
++	static_cast<timer *>(t)->expire_ms = expire_time;
++}
++
++int netdev_slirp::cb_add_poll(slirp_fd fd, int events, void *opaque)
++{
++	auto *self = static_cast<netdev_slirp *>(opaque);
++	short ev = 0;
++	if (events & SLIRP_POLL_IN) ev |= POLLIN;
++	if (events & SLIRP_POLL_OUT) ev |= POLLOUT;
++#if !defined(_WIN32)
++	if (events & SLIRP_POLL_PRI) ev |= POLLPRI;
++#endif
++	self->m_pollfds.push_back({ decltype(self->m_pollfds[0].fd)(fd), ev, 0 });
++	return int(self->m_pollfds.size() - 1);
++}
++
++int netdev_slirp::cb_get_revents(int idx, void *opaque)
++{
++	auto *self = static_cast<netdev_slirp *>(opaque);
++	if (idx < 0 || idx >= int(self->m_pollfds.size()))
++		return 0;
++	const short re = self->m_pollfds[idx].revents;
++	int events = 0;
++	if (re & POLLIN) events |= SLIRP_POLL_IN;
++	if (re & POLLOUT) events |= SLIRP_POLL_OUT;
++#if !defined(_WIN32)
++	if (re & POLLPRI) events |= SLIRP_POLL_PRI;
++#endif
++	if (re & POLLERR) events |= SLIRP_POLL_ERR;
++	if (re & POLLHUP) events |= SLIRP_POLL_HUP;
++	return events;
++}
++
++std::unique_ptr<network_device> slirp_module::open_device(int id, network_handler &handler)
++{
++	if (id != 0)
++		return nullptr;
++	return std::make_unique<netdev_slirp>(handler);
++}
++
++} // anonymous namespace
++
++} // namespace osd
++
++#else
++
++namespace osd { namespace { MODULE_NOT_SUPPORTED(slirp_module, OSD_NETDEV_PROVIDER, "slirp") } }
++
++#endif
++
++MODULE_DEFINITION(NETDEV_SLIRP, osd::slirp_module)

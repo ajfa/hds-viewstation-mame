@@ -1,0 +1,18 @@
+diff --git a/src/devices/machine/i82586.cpp b/src/devices/machine/i82586.cpp
+index 6c5f3be3..5ac00bdc 100644
+--- a/src/devices/machine/i82586.cpp
++++ b/src/devices/machine/i82586.cpp
+@@ -1250,8 +1250,11 @@ void i82596_device::port(u32 data)
+ 		break;
+ 
+ 	case 1:
+-		// execute a self-test
+-		LOG("port self-test\n");
++		// execute a self-test: write the ROM signature and a clean result word to the
++		// 16-byte aligned address given with the command
++		LOG("port self-test 0x%08x\n", data & ~0xf);
++		m_space->write_dword((data & ~0xf) + 0, 0);
++		m_space->write_dword((data & ~0xf) + 4, 0);
+ 		break;
+ 
+ 	case 2:

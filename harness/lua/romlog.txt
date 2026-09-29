@@ -1,0 +1,1 @@
+bpset 3000c2f0,1,{logerror "ROMLOG %d %08x %08x %08x %08x\n",g0,g1,g2,g3,g4; g}

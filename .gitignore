@@ -1,0 +1,16 @@
+# Nothing here redistributes HDS or Neoware software, boot PROMs or disk images.
+*.hd
+*.img
+*.iso
+*.bin
+*.dec
+*.zip
+roms/
+HDS-netOS-Windows/
+__pycache__/
+tools/dasm960/dasm960
+*.log
+run.out
+error.log
+vram.bin
+dram.bin

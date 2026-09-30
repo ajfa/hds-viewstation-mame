@@ -133,6 +133,8 @@ Good to know
 - To go back to the factory state, delete the "state" folder and take
   disk\netos.hd out of the zip again.
 - Screenshots (F12 key) go to "snapshots".
+- The machine has 24 MB of memory. For 40 or 72 MB, start a launcher from a command
+  prompt with MAME's -ram option, for example: NETOS.bat -ram 72m
 
 
 What is in the pack

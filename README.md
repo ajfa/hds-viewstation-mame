@@ -22,6 +22,9 @@ netOS 3.2 CD, and the tools in this repository build the disk from it.
   the console window and the bundled applications.
 - Four monitors and screen sizes, as separate systems: `hdsfx` (1280x1024), `hdsfxv16`
   (1152x900), `hdsfxv14` (1024x768) and `hdsfxvesa` (800x600).
+- 24, 40 or 72 MB of memory with MAME's `-ram` option (`-ram 72m`): the 8 MB of the main
+  board plus a 16, 32 or 64 MB SIMM. netOS reports them as 24, 40 and 72 MB. The default
+  is 24 MB.
 - Keyboard and PS/2 mouse.
 - The Ethernet controller, with user mode networking (libslirp): netOS gets an address by
   DHCP and reaches the Internet with no host setup and no administrator rights.

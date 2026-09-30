@@ -17,7 +17,8 @@
       21a00000-21bfffff  off-screen memory
       21c00000-21dfffff  video memory block write: each word is a 16 pixel mask
       21e00000/21fffffc  block write colour registers
-      30000000-          DRAM; SIMM banks at 40000000-7fffffff (each repeats in its window)
+      30000000-          DRAM, 8 MB; SIMM banks at 40000000-7fffffff (each repeats in its
+                         window); -ram 24m (default), 40m or 72m sets the one at 40000000
       a8000000/ac000000  board control registers (16 bit)
       c0000000-          G300-style colour video controller (palette words 000-0ff), or on
                          the FX colour board a TLC34075 palette DAC in bytes 0-f; both
@@ -48,6 +49,7 @@
 #include "machine/nvram.h"
 #include "machine/pckeybrd.h"
 #include "machine/pit8253.h"
+#include "machine/ram.h"
 #include "video/tlc34076.h"
 
 #include "bus/ata/ataintf.h"
@@ -87,6 +89,7 @@ public:
 		, m_mouse_y(*this, "MOUSEY")
 		, m_mouse_btn(*this, "MOUSEBTN")
 		, m_ata(*this, "ata")
+		, m_ram(*this, "ram")
 		, m_ramdac(*this, "ramdac")
 		, m_config(*this, "CONFIG")
 	{
@@ -110,6 +113,7 @@ private:
 	required_ioport m_mouse_y;
 	required_ioport m_mouse_btn;
 	required_device<ata_interface_device> m_ata;
+	required_device<ram_device> m_ram;
 	required_device<tlc34076_device> m_ramdac;
 	required_ioport m_config;
 	bool m_colour = false;
@@ -300,6 +304,11 @@ void viewstation_state::ata8_w(offs_t offset, uint8_t data)
 
 void viewstation_state::machine_start()
 {
+	// the 8 MB on the main board are fixed; the rest of -ram is SIMM memory at 40000000,
+	// which repeats through its 128 MB window like the main board memory
+	const u32 simm = m_ram->size() - 0x800000;
+	m_maincpu->space(AS_PROGRAM).install_ram(0x40000000, 0x40000000 + simm - 1, 0x07ffffff & ~(simm - 1), m_ram->pointer());
+
 	// attach the Ethernet controller to the first host network device
 	m_eth->set_interface(0);
 	m_mouse_timer = timer_alloc(FUNC(viewstation_state::mouse_poll), this);
@@ -520,7 +529,6 @@ void viewstation_state::mem_map(address_map &map)
 	}));
 	// banks do not decode the address lines above their size, so they repeat through their 128 MB window
 	map(0x30000000, 0x307fffff).ram().share(m_dram).mirror(0x07800000);
-	map(0x40000000, 0x40ffffff).ram().mirror(0x07000000);
 	map(0xa0000000, 0xefffffff).rw(FUNC(viewstation_state::unk_r), FUNC(viewstation_state::unk_w));
 	map(0xc0000000, 0xc0000fff).lrw32(
 		NAME([this] (offs_t offset, uint32_t mem_mask) {
@@ -573,6 +581,9 @@ void viewstation_state::hdsfx(machine_config &config)
 {
 	I80960CA(config, m_maincpu, 33_MHz_XTAL);
 	m_maincpu->set_addrmap(AS_PROGRAM, &viewstation_state::mem_map);
+
+	// 8 MB on the main board plus a 16, 32 or 64 MB SIMM
+	RAM(config, m_ram).set_default_size("24M").set_extra_options("40M,72M");
 
 	screen_device &screen(SCREEN(config, "screen"));
 	screen.set_refresh_hz(60);

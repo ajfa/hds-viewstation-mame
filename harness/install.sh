@@ -10,7 +10,7 @@ here=$(cd "$(dirname "$0")/.." && pwd)
 mkdir -p "$MAME_SRC/src/mame/hds"
 cp "$here/driver/viewstation.cpp" "$MAME_SRC/src/mame/hds/viewstation.cpp"
 cd "$MAME_SRC"
-for p in i960-ca i82596-self-test slirp-network mame-lst ui-skip-warnings; do
+for p in i960-ca i82596-self-test slirp-network network-reopen mame-lst ui-skip-warnings; do
 	if git apply --check "$here/patches/$p.patch" 2> /dev/null; then
 		git apply "$here/patches/$p.patch"
 		echo "applied $p"

@@ -1,0 +1,16 @@
+diff --git a/src/emu/dinetwork.cpp b/src/emu/dinetwork.cpp
+index d5053a6d..bf802187 100644
+--- a/src/emu/dinetwork.cpp
++++ b/src/emu/dinetwork.cpp
+@@ -156,7 +156,11 @@ void device_network_interface::set_mac(const u8 *mac)
+ void device_network_interface::set_interface(int id)
+ {
+ 	if (m_dev)
++	{
++		// release the old device first: it may hold a resource the new one needs
+ 		stop_net_device();
++		m_dev.reset();
++	}
+ 
+ 	m_dev = device().machine().osd().open_network_device(id, *this);
+ 	if (m_dev)

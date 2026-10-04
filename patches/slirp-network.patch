@@ -115,10 +115,10 @@ index 9625bae6..4495c62a 100644
  	REGISTER_MODULE(m_mod_man, NETDEV_NONE);
 diff --git a/src/osd/modules/netdev/slirp.cpp b/src/osd/modules/netdev/slirp.cpp
 new file mode 100644
-index 00000000..561d391c
+index 00000000..ac01408a
 --- /dev/null
 +++ b/src/osd/modules/netdev/slirp.cpp
-@@ -0,0 +1,333 @@
+@@ -0,0 +1,442 @@
 +// license:BSD-3-Clause
 +// copyright-holders:
 +/*
@@ -128,6 +128,12 @@ index 00000000..561d391c
 + * DHCP server, a gateway at 10.0.2.2 and a DNS forwarder at 10.0.2.3, and its TCP and
 + * UDP traffic leaves through ordinary host sockets. No privileges or host network
 + * configuration are needed.
++ *
++ * MAME_SLIRP_NET="a.b.c" moves the network to a.b.c.0/24 (gateway .2, DNS .3, DHCP from
++ * .20). MAME_SLIRP_LAN="localport:remotehost:remoteport" also joins a LAN carried as raw
++ * Ethernet frames over UDP (QEMU's "-netdev dgram"): frames for slirp's own addresses
++ * (52:55:...) go to slirp, unicast to any other station goes to the LAN, and broadcasts
++ * go to both, so slirp never sees the traffic between the guests.
 + */
 +#include "netdev_module.h"
 +
@@ -142,7 +148,10 @@ index 00000000..561d391c
 +#include "util/hashing.h" // crc32_creator
 +
 +#include <chrono>
++#include <cstdlib>
++#include <cstring>
 +#include <deque>
++#include <string>
 +#include <list>
 +#include <memory>
 +#include <vector>
@@ -152,7 +161,10 @@ index 00000000..561d391c
 +#include <ws2tcpip.h>
 +#else
 +#include <arpa/inet.h>
++#include <fcntl.h>
 +#include <poll.h>
++#include <sys/socket.h>
++#include <unistd.h>
 +#endif
 +
 +#include <slirp/libslirp.h>
@@ -228,6 +240,8 @@ index 00000000..561d391c
 +
 +	void run_slirp();
 +	int64_t now_ms() const;
++	void open_lan(const std::string &spec);
++	int recv_lan();
 +
 +	// libslirp callbacks
 +	static slirp_len cb_send_packet(const void *buf, size_t len, void *opaque);
@@ -253,6 +267,13 @@ index 00000000..561d391c
 +	std::vector<pollfd> m_pollfds;
 +#endif
 +	uint8_t m_buf[2048];
++#if defined(_WIN32)
++	SOCKET m_lan = INVALID_SOCKET;
++#else
++	int m_lan = -1;
++#endif
++	bool m_lan_on = false;
++	sockaddr_in m_lan_peer;
 +};
 +
 +netdev_slirp::netdev_slirp(network_handler &handler)
@@ -262,11 +283,17 @@ index 00000000..561d391c
 +	SlirpConfig cfg = {};
 +	cfg.version = 1;
 +	cfg.in_enabled = true;
-+	inet_pton(AF_INET, "10.0.2.0", &cfg.vnetwork);
++	std::string net = "10.0.2", dhcp = ".15";
++	if (const char *env = std::getenv("MAME_SLIRP_NET"))
++	{
++		net = env;
++		dhcp = ".20";
++	}
++	inet_pton(AF_INET, (net + ".0").c_str(), &cfg.vnetwork);
 +	inet_pton(AF_INET, "255.255.255.0", &cfg.vnetmask);
-+	inet_pton(AF_INET, "10.0.2.2", &cfg.vhost);
-+	inet_pton(AF_INET, "10.0.2.15", &cfg.vdhcp_start);
-+	inet_pton(AF_INET, "10.0.2.3", &cfg.vnameserver);
++	inet_pton(AF_INET, (net + ".2").c_str(), &cfg.vhost);
++	inet_pton(AF_INET, (net + dhcp).c_str(), &cfg.vdhcp_start);
++	inet_pton(AF_INET, (net + ".3").c_str(), &cfg.vnameserver);
 +	cfg.if_mtu = 1500;
 +	cfg.if_mru = 1500;
 +
@@ -282,13 +309,79 @@ index 00000000..561d391c
 +	m_cb.notify = cb_notify;
 +
 +	m_slirp = slirp_new(&cfg, &m_cb, this);
-+	osd_printf_verbose("slirp: %s\n", m_slirp ? "network up" : "slirp_new failed");
++	osd_printf_verbose("slirp: %s on %s.0/24\n", m_slirp ? "network up" : "slirp_new failed", net);
++	if (const char *env = std::getenv("MAME_SLIRP_LAN"))
++		open_lan(env);
++}
++
++void netdev_slirp::open_lan(const std::string &spec)
++{
++	std::string lport, rhost = "127.0.0.1", rport;
++	const auto a = spec.find(':');
++	const auto b = spec.rfind(':');
++	lport = spec.substr(0, a);
++	if (a == b)
++		rport = spec.substr(a + 1);
++	else
++	{
++		rhost = spec.substr(a + 1, b - a - 1);
++		rport = spec.substr(b + 1);
++	}
++	std::memset(&m_lan_peer, 0, sizeof(m_lan_peer));
++	m_lan_peer.sin_family = AF_INET;
++	m_lan_peer.sin_port = htons(uint16_t(std::atoi(rport.c_str())));
++	inet_pton(AF_INET, rhost.c_str(), &m_lan_peer.sin_addr);
++
++	m_lan = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
++	sockaddr_in local;
++	std::memset(&local, 0, sizeof(local));
++	local.sin_family = AF_INET;
++	local.sin_port = htons(uint16_t(std::atoi(lport.c_str())));
++	inet_pton(AF_INET, "127.0.0.1", &local.sin_addr);
++	if (::bind(m_lan, reinterpret_cast<sockaddr *>(&local), sizeof(local)) != 0)
++	{
++		osd_printf_error("slirp: cannot bind LAN port 127.0.0.1:%s\n", lport);
++#if defined(_WIN32)
++		closesocket(m_lan);
++#else
++		close(m_lan);
++#endif
++		return;
++	}
++#if defined(_WIN32)
++	u_long nb = 1;
++	ioctlsocket(m_lan, FIONBIO, &nb);
++	// a peer that is not running yet must not turn every later read into WSAECONNRESET
++	BOOL off = FALSE;
++	DWORD ret = 0;
++	WSAIoctl(m_lan, _WSAIOW(IOC_VENDOR, 12), &off, sizeof(off), nullptr, 0, &ret, nullptr, nullptr);
++#else
++	fcntl(m_lan, F_SETFL, fcntl(m_lan, F_GETFL, 0) | O_NONBLOCK);
++#endif
++	m_lan_on = true;
++	osd_printf_verbose("slirp: LAN 127.0.0.1:%s <-> %s:%s\n", lport, rhost, rport);
++}
++
++int netdev_slirp::recv_lan()
++{
++	if (!m_lan_on)
++		return 0;
++	const int n = ::recv(m_lan, reinterpret_cast<char *>(m_buf), sizeof(m_buf) - 4, 0);
++	return n > 0 ? n : 0;
 +}
 +
 +netdev_slirp::~netdev_slirp()
 +{
 +	if (m_slirp)
 +		slirp_cleanup(m_slirp);
++	if (m_lan_on)
++	{
++#if defined(_WIN32)
++		closesocket(m_lan);
++#else
++		close(m_lan);
++#endif
++	}
 +}
 +
 +int64_t netdev_slirp::now_ms() const
@@ -300,8 +393,17 @@ index 00000000..561d391c
 +{
 +	if (!m_slirp)
 +		return 0;
-+	slirp_input(m_slirp, reinterpret_cast<const uint8_t *>(buf), len);
-+	run_slirp();
++	auto *frame = reinterpret_cast<const uint8_t *>(buf);
++	const bool group = frame[0] & 1;
++	const bool to_slirp = group || (frame[0] == 0x52 && frame[1] == 0x55);
++	if (m_lan_on && (group || !to_slirp))
++		::sendto(m_lan, reinterpret_cast<const char *>(buf), len, 0,
++				reinterpret_cast<const sockaddr *>(&m_lan_peer), sizeof(m_lan_peer));
++	if (to_slirp)
++	{
++		slirp_input(m_slirp, frame, len);
++		run_slirp();
++	}
 +	return len;
 +}
 +
@@ -311,13 +413,20 @@ index 00000000..561d391c
 +		return 0;
 +	if (m_rx.empty())
 +		run_slirp();
++	u32 length;
 +	if (m_rx.empty())
-+		return 0;
-+
-+	std::vector<uint8_t> frame = std::move(m_rx.front());
-+	m_rx.pop_front();
-+	u32 length = std::min<size_t>(frame.size(), sizeof(m_buf) - 4);
-+	std::copy_n(frame.begin(), length, m_buf);
++	{
++		length = recv_lan();
++		if (!length)
++			return 0;
++	}
++	else
++	{
++		std::vector<uint8_t> frame = std::move(m_rx.front());
++		m_rx.pop_front();
++		length = std::min<size_t>(frame.size(), sizeof(m_buf) - 4);
++		std::copy_n(frame.begin(), length, m_buf);
++	}
 +
 +	// pad to the Ethernet minimum and append the frame check sequence, as the taptun module does
 +	if (length < ETHERNET_MIN_FRAME - 4)

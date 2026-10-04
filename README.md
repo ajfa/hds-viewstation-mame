@@ -28,6 +28,8 @@ netOS 3.2 CD, and the tools in this repository build the disk from it.
 - Keyboard and PS/2 mouse.
 - The Ethernet controller, with user mode networking (libslirp): netOS gets an address by
   DHCP and reaches the Internet with no host setup and no administrator rights.
+- A local network with a machine emulated in QEMU, through the same provider, without
+  losing the Internet: [docs/NETWORK.md](docs/NETWORK.md).
 - Netscape Navigator 3.0 for the i960, from the same CD, with its home on a writable
   4.2BSD partition that netOS mounts as `/disk1`. Only `http://` sites work;
   <http://theoldnet.com> serves the old web in a form it can show.
@@ -42,7 +44,7 @@ the vertical retrace interrupt and the flash board.
 | Intel 80960CA | added to MAME's i960 core, which only had the 80960KB, plus five bug fixes: [docs/CPU.md](docs/CPU.md) |
 | video | G300 and TLC34075 boards, VRAM block write, monitor switches: [docs/VIDEO.md](docs/VIDEO.md) |
 | disk | a 4.4BSD label, the boot code, netOS's read-only devf file system and a writable /disk1: [docs/DISK.md](docs/DISK.md) |
-| Ethernet | 82596 self-test, a libslirp network provider for MAME: [docs/NETWORK.md](docs/NETWORK.md) |
+| Ethernet | 82596 self-test, a libslirp network provider for MAME, a LAN with QEMU: [docs/NETWORK.md](docs/NETWORK.md) |
 | the rest | memory map, interrupts, keyboard controller, boot PROM: [docs/HARDWARE.md](docs/HARDWARE.md) |
 
 Two findings cost the most time. MAME's `addc` never produced a carry, which broke the
@@ -54,7 +56,8 @@ off. And the VRAM block write covers 16 pixels per word, with the second half of
 
     driver/     the MAME driver, one file (src/mame/hds/viewstation.cpp)
     patches/    changes to MAME: the i960 core, the 82596 self-test, the slirp network
-                provider, the machine list, and an optional startup warnings fix
+                provider, reopening a network device, the machine list, and an
+                optional startup warnings fix
     tools/      disk builder, netOS overlay, LZRW3-A unpacker, i960 disassembler
     harness/    install, build, run headless, Netscape's first run, pack assembly
     pack/       launchers and README of the Windows pack
